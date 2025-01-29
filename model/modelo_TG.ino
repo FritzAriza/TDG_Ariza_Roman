@@ -5,7 +5,6 @@
 #include "esp_heap_caps.h"
 #include "TensorFlowLite_ESP32.h"
 #include "AudioTools/AudioLibs/AudioSourceSD.h"
-#include "AudioTools/AudioCodecs/CodecMP3Helix.h"
 #include "AudioTools/AudioLibs/AudioBoardStream.h"
 #include "tensorflow/lite/micro/all_ops_resolver.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
@@ -19,22 +18,23 @@ const int FRAME_LENGTH = 256;
 const int SAMPLE_RATE = 16000;
 const int TARGET_LENGTH = 8000;
 const int BITS_PER_SAMPLE = 16;
-const char* FILE_NAME = "/rec.wav";
+const char* FILE_NAME = "/rec/rec.wav";
 const int NUM_COLS = FRAME_LENGTH / 2 + 1;
 const float ANGLE_BASE = -2.0f * M_PI / FRAME_LENGTH;
-const char* labels[] = {"abre", "apaga", "cierra", "dime", "enciende"};
-const char* const FILE_PATHS[] = {"/abre/", "/apaga/", "/cierra/", "/dime/", "/enciende/"};
+const char* const FILE_EXTRAS[] = {"/rec/", "/inicio/"};
+const char* labels[] = {"abre", "apaga", "cierra", "dime", "enciende", "ruido"};
+const char* const FILE_PATHS[] = {"/abre/", "/apaga/", "/cierra/", "/dime/", "/enciende/", "/ruido/"};
 
 File audioFile;
-MP3DecoderHelix decoder;
+WAVDecoder decoder;
 AudioBoardStream audioKit(AudioKitEs8388V1);
-AudioSourceSD source("/", "mp3", PIN_AUDIO_KIT_SD_CARD_CS);
+AudioSourceSD source("/", "wav", PIN_AUDIO_KIT_SD_CARD_CS);
 AudioInfo audioInfo(SAMPLE_RATE, CHANNELS, BITS_PER_SAMPLE);
 EncodedAudioStream audioOutput(&audioFile, new WAVEncoder());
 StreamCopy audioCopier(audioOutput, audioKit);
 AudioPlayer player(source, audioKit, decoder);
 
-constexpr size_t kTensorArenaSize = 30 * 1024;
+constexpr size_t kTensorArenaSize = 40 * 1024;
 uint8_t *tensor_arena;
 tflite::MicroErrorReporter micro_error_reporter;
 tflite::ErrorReporter* error_reporter = &micro_error_reporter;
@@ -43,7 +43,10 @@ tflite::MicroInterpreter* interpreter = nullptr;
 
 bool isRecording = false;
 unsigned long recordingStartTime = 0;
-const unsigned long RECORDING_DURATION = 3000;
+const unsigned long RECORDING_DURATION = 2500;
+
+float* cosTable = nullptr;
+float* sinTable = nullptr;
 
 float* spectrogram = nullptr;
 float* spectrogramReSize = nullptr;
@@ -97,6 +100,22 @@ void manageSD(const char* filename, const char* mode) {
   }
 }
 
+void handleButton1(bool, int, void*) {
+  if (!isRecording) {
+    playExtras(0);
+  } else {
+    Serial.println("Error: Detenga la grabación antes de escuchar el audio.");
+  }
+}
+
+void handleButton6(bool, int, void*) {
+  if (!isRecording) {
+    playExtras(1);
+  } else {
+    Serial.println("Error: Detenga la grabación antes de escuchar el audio.");
+  }
+}
+
 void handleButton3(bool, int, void*) {
   if (isRecording) {
     stopRecording();
@@ -107,6 +126,8 @@ void handleButton3(bool, int, void*) {
 }
 
 void startRecording() {
+  audioCopier.begin(audioOutput, audioKit);
+  audioCopier.setActive(true);
   manageSD(FILE_NAME, FILE_WRITE);
   audioOutput.begin(audioInfo);
   isRecording = true;
@@ -121,6 +142,8 @@ void stopRecording() {
     Serial.println("Grabación detenida.");
   }
   isRecording = false;
+  audioCopier.setActive(false);
+  audioCopier.end();
 }
 
 void handleButton4(bool, int, void*) {
@@ -132,25 +155,17 @@ void handleButton4(bool, int, void*) {
 }
 
 void playAudio(int indexPath) {
-    player.stop();
-    source.setPath(FILE_PATHS[indexPath]);
-    player.begin();
-    player.setAutoNext(false);
+  player.stop();
+  source.setPath(FILE_PATHS[indexPath]);
+  player.begin();
+  player.setAutoNext(false);
 }
 
-void dft(const float input[], float* output) {
-  for (int k = 0; k < FRAME_LENGTH / 2; ++k) { // Solo hasta la mitad más uno (N/2 + 1)
-    float realPart = 0.0f;
-    float imagPart = 0.0f;
-
-    for (int n = 0; n < FRAME_LENGTH; ++n) {
-      float angle = ANGLE_BASE * n * k;
-      realPart += input[n] * cos(angle);
-      imagPart += input[n] * sin(angle);
-    }
-
-    output[k] = sqrt(realPart * realPart + imagPart * imagPart);
-  }
+void playExtras(int indexExtras) {
+  player.stop();
+  source.setPath(FILE_EXTRAS[indexExtras]);
+  player.begin();
+  player.setAutoNext(false);
 }
 
 void exportSpectrogramToCSV(float* spectrogram, int numFrames, const char* filename) {
@@ -160,7 +175,7 @@ void exportSpectrogramToCSV(float* spectrogram, int numFrames, const char* filen
   for (int i = 0; i < numFrames; ++i) {
     for (int j = 0; j < NUM_COLS; ++j) {
       int index = i * NUM_COLS + j;
-      audioFile.print(spectrogram[index], 8);
+      audioFile.print(spectrogram[index], 4);
       if (j < NUM_COLS - 1) {
         audioFile.print(",");
       }
@@ -234,13 +249,54 @@ void computeHannWindow(float* window) {
   }
 }
 
+void precomputeTables() {
+  if (cosTable) {
+    free(cosTable);
+  }
+  if (sinTable) {
+    free(sinTable);
+  }
+
+  cosTable = (float*)heap_caps_malloc((FRAME_LENGTH / 2) * FRAME_LENGTH * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  sinTable = (float*)heap_caps_malloc((FRAME_LENGTH / 2) * FRAME_LENGTH * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+  if (cosTable == nullptr || sinTable == nullptr) {
+    Serial.println("Error al asignar memoria en la SPIRAM.");
+    while (true); // Detener el programa si falla la asignación
+  } else {
+    Serial.printf("Memoria asignada para cosTable: %d bytes\n", (FRAME_LENGTH / 2) * FRAME_LENGTH * sizeof(float));
+    Serial.printf("Memoria asignada para sinTable: %d bytes\n", (FRAME_LENGTH / 2) * FRAME_LENGTH * sizeof(float));
+  }
+
+  for (int k = 0; k < FRAME_LENGTH / 2; ++k) {
+    for (int n = 0; n < FRAME_LENGTH; ++n) {
+      float angle = ANGLE_BASE * n * k;
+      cosTable[k * FRAME_LENGTH + n] = cos(angle);
+      sinTable[k * FRAME_LENGTH + n] = sin(angle);
+    }
+  }
+}
+
+void dft(const float input[], float* output) {
+  for (int k = 0; k < FRAME_LENGTH / 2; ++k) { // Solo hasta la mitad
+    float realPart = 0.0f;
+    float imagPart = 0.0f;
+
+    for (int n = 0; n < FRAME_LENGTH; ++n) {
+      realPart += input[n] * cosTable[k * FRAME_LENGTH + n];
+      imagPart += input[n] * sinTable[k * FRAME_LENGTH + n];
+    }
+
+    output[k] = sqrtf(realPart * realPart + imagPart * imagPart);
+  }
+}
+
 void processFrames(const std::vector<float>& waveform, float* spectrogram, const float* window, int numFrames) {
-  float dftOutput[2 * FRAME_LENGTH];
+  float dftOutput[NUM_COLS - 1];
+  
   Serial.println("Creando espectrograma...");
 
   for (int i = 0; i < numFrames; i++) {
-    if (i % 10 == 0) Serial.printf("Procesando frame %d/%d...\n", i + 1, numFrames);
-
     int startIdx = i * FRAME_STEP;
 
     float windowedFrame[FRAME_LENGTH];
@@ -336,7 +392,6 @@ int processInferenceResults(TfLiteTensor* output) {
   return predictedIndex;
 }
 
-
 void analyzeRecordedAudio() {
   Serial.println("Iniciando análisis de comando...");
   
@@ -359,6 +414,7 @@ void analyzeRecordedAudio() {
   }
 
   audioFile.close();
+  // audioFile = File();
 
   if (audioData.size() < TARGET_LENGTH) {
     audioData.resize(TARGET_LENGTH, 0.0f);
@@ -377,8 +433,7 @@ void analyzeRecordedAudio() {
   Serial.println("Generando espectrograma...");
   computeHannWindow(window);
   processFrames(audioData, spectrogram, window, numFrames);
-  exportSpectrogramToCSV(spectrogram, numFrames, "/spectrogram.csv");
-
+  // exportSpectrogramToCSV(spectrogram, numFrames, "/spectrogram.csv");
   normalizeSpectrogram(spectrogram, numFrames);
 
   bilinearResize(spectrogram, numFrames, spectrogramReSize);
@@ -428,6 +483,8 @@ void setup() {
   audioConfig.input_device = ADC_INPUT_LINE2; // Micrófono
   audioKit.begin(audioConfig);
 
+  audioKit.addAction(audioKit.getKey(1), handleButton1);
+  audioKit.addAction(audioKit.getKey(6), handleButton6);
   audioKit.addAction(audioKit.getKey(3), handleButton3);
   audioKit.addAction(audioKit.getKey(4), handleButton4);
 
@@ -459,7 +516,13 @@ void setup() {
       Serial.println("Modelo cargado y tensores asignados correctamente.");
   }
 
-  Serial.println("Sistema listo. Pulse 3 para grabar o 4 para analizar audio.");
+  Serial.println("Precomputando tablas de seno y coseno...");
+  precomputeTables();
+  Serial.println("Tablas precomputadas.");
+  
+  audioCopier.setActive(false);
+  
+  Serial.println("Sistema listo. Pulse 1 para reproducir el audio grabado, 3 para grabar o 4 para analizar audio.");
 }
 
 void loop() {
